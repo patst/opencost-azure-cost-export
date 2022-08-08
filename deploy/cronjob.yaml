@@ -1,0 +1,70 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: azure-cost-exporter
+spec:
+  schedule: "0 8 * * *" # run at 8 o clock # https://crontab.guru/#0_6_*_*_*
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 1
+  successfulJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          containers:
+            - name: azurecostexporter
+              image: patst/opencost-azure-cost-export:latest # alternative: "<your-container-image-with-azurecli-curl-and-jq>"
+              command:
+                - /bin/sh
+                - -c
+                - /mnt/script/createCostExport.sh
+              workingDir: /var/run/exporter
+              env:
+                - name: AZURE_CLIENT_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: azure-account-creds
+                      key: clientId
+                - name: AZURE_CLIENT_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: azure-account-creds
+                      key: clientSecret
+                - name: AZURE_TENANT_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: azure-account-creds
+                      key: tenantId
+                - name: AZURE_SUBSCRIPTION_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: azure-account-creds
+                      key: subscriptionId
+                - name: TARGET_STORAGE_ACCOUNT_NAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: azure-account-creds
+                      key: targetStorageAccountName
+              volumeMounts:
+                - mountPath: /mnt/script
+                  name: script-volume
+                - name: working-dir
+                  mountPath: /var/run/exporter
+                - name: azure-cli-temp # enables us to start with read only filesystem
+                  mountPath: /.azure
+          restartPolicy: OnFailure
+          volumes:
+            - name: script-volume
+              configMap:
+                name: azure-cost-exporter-script
+                items:
+                  - key: createCostExport.sh
+                    path: createCostExport.sh
+                defaultMode: 0777
+            - name: working-dir
+              emptyDir:
+                sizeLimit: 100Mi
+            - name: azure-cli-temp
+              emptyDir:
+                sizeLimit: 100Mi

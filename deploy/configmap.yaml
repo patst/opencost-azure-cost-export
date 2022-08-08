@@ -1,0 +1,98 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: azure-cost-exporter-script
+data:
+  createCostExport.sh: |
+    #!/usr/bin/env bash
+    # requires: az-cli, curl, jq
+      set -e
+      
+    if [ -z "$AZURE_CLIENT_ID" ]; then
+      echo "AZURE_CLIENT_ID not set"
+      exit 1
+    fi
+    if [ -z "$AZURE_CLIENT_SECRET" ]; then
+      echo "AZURE_CLIENT_SECRET not set"
+      exit 1
+    fi
+    if [ -z "$AZURE_TENANT_ID" ]; then
+      echo "AZURE_TENANT_ID not set"
+      exit 1
+    fi
+    if [ -z "$AZURE_SUBSCRIPTION_ID" ]; then
+      echo "AZURE_SUBSCRIPTION_ID not set"
+      exit 1
+    fi
+    if [ -z "$TARGET_STORAGE_ACCOUNT_NAME" ]; then
+      echo "TARGET_STORAGE_ACCOUNT_NAME not set"
+      exit 1
+    fi
+      
+    az version
+    jq --version
+    curl --version
+      
+    # login with azure cli
+    az login --service-principal -u "$AZURE_CLIENT_ID" -p "$AZURE_CLIENT_SECRET" --tenant "$AZURE_TENANT_ID" --allow-no-subscriptions
+    
+    accessToken=$(az account get-access-token --resource https://management.azure.com/ --query accessToken --output tsv)
+    
+    startDate=$(date '+%Y-%m-01')
+    endDate=$(date '+%Y-%m-%d')
+    generateCostDetailsReportBody="{ \"timePeriod\": { \"start\": \"${startDate}\", \"end\": \"${endDate}\"} }"
+    
+    RESPONSE_CODE=$(curl -s -w "%{http_code}"  -o "generateCostDetailsReport.json" --location \
+         --request POST "https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/providers/Microsoft.CostManagement/generateCostDetailsReport?api-version=2022-05-01" \
+         --data "$generateCostDetailsReportBody" \
+         --header 'Accept: application/json' \
+         --header "Authorization: Bearer $accessToken" \
+         --dump-header ./generateCostDetailsReportHeaders.txt --silent )
+      
+    if [ "$RESPONSE_CODE" != 202 ]
+      then
+      echo "ERROR-01: Could not create generateCostDetailsReport. Response Code=$RESPONSE_CODE ;body=$(cat generateCostDetailsReport.json)"
+      exit 1
+    fi
+    
+    # return a carriage return from the end of the location url
+    operationLocation="$(cat generateCostDetailsReportHeaders.txt | grep location | sed 's/location: //' | sed 's/\r//g')"
+    echo "Polling operation status with URL $operationLocation"
+    RESPONSE_CODE=$(curl -s -w "%{http_code}" --location --request GET "${operationLocation}" \
+      --header 'Accept: application/json' \
+      --header "Authorization: Bearer $accessToken" \
+      -o "costDetailsOperationResults.json")
+    
+    echo "Response code: $RESPONSE_CODE"
+    if [ "$RESPONSE_CODE" != 200 ]
+    then
+      echo "ERROR-02: Could not get costDetailsOperationResults. Response Code=$RESPONSE_CODE ;body=$(cat costDetailsOperationResults.json)"
+      exit 1
+    fi
+      
+    # example response:
+    # {"id":"/subscriptions/49345349-9387-4122-9938-19ec070632f5/providers/Microsoft.CostManagement/costDetailsOperationResults/9017dd7b-54e9-4423-94d5-64a0673ea3e1","name":"9017dd7b-54e9-4423-94d5-64a0673ea3e1","status":"Completed","manifest":{"manifestVersion":"2022-05-01","dataFormat":"Csv","byteCount":6643840,"blobCount":1,"compressData":false,"requestContext":{"requestScope":"/subscriptions/9017dd7b-9387-4122-9938-19ec070632f5/","requestBody":{"metric":"ActualCost","timePeriod":{"start":"2022-07-01T00:00:00","end":"2022-07-28T00:00:00"},"invoiceId":null,"billingPeriod":null}},"blobs":[{"blobLink":"https://ccmreportstoragenortheu3.blob.core.windows.net/armreports/20220728/9017dd7b-54e9-4423-94d5-64a0673ea3e1?sv=2016-05-31&sr=b&sig=UEFej6rB1QtUZLsdfsdfqj0oQmWyGXHp9FJG6hs%2FmmFJzY%3D&spr=https&st=2022-07-28T09%3A47%3A35Z&se=2022-07-28T21%dA52%3A35Z&sp=r","byteCount":6643840}]},"validTill":"2022-07-28T21:52:35.7104120Z"}%
+    reportLink=$(jq -r '.manifest.blobs[0].blobLink' costDetailsOperationResults.json)
+    reportName=$(jq -r '.name' costDetailsOperationResults.json)
+    
+    echo "Downloading report from public azure storage account:  $reportLink"
+      RESPONSE_CODE=$(curl -s -w "%{http_code}" \
+      --request GET "$reportLink" \
+      -o "report.csv" \
+      --location)
+    if [ "$RESPONSE_CODE" != 200 ]
+      then
+      echo "ERROR-03: Could not get report csv. Response Code=$RESPONSE_CODE ;body=$(cat report.csv)"
+      exit 1
+    fi
+      
+    # path for azure exports configured via UI:
+    # <exportname>/<time-from>-<time-to>/<exportname>_uuid
+    # test/20220801-20220831/test_74ddd963-1d30-427f-90fc-g0a960aa5a80.csv
+    timerange="$(date '+%Y%m01')-$(date -d "`date +%Y%m01` +1 month -1 day" +%Y%m%d)"
+    reportTargetFileName="export_${reportName}.csv"
+    echo "Uploading to target blob name $reportTargetFileName for timerange $timerange"
+    az storage blob upload --overwrite --auth-mode login --account-name "${TARGET_STORAGE_ACCOUNT_NAME}" --container-name cost-analyzer --name "export/${timerange}/${reportTargetFileName}" --file report.csv
+    echo "upload was successful with filename $reportTargetFileName"
+    
